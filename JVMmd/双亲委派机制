@@ -1,0 +1,195 @@
+# 双亲委派机制
+
+## 作用
+
++ 保证类加载的安全性
+
+  通过双亲委派机制避免恶意代码替换JDK中的核心类库，比如`java.lang.String`，确保核心类库的完整性和安全性。
+
++ 避免重复加载
+
+  双亲委派机制可以避免同一个类被多次加载。
+
+## 机制
+
+当一个类加载器接收到加载类的任务时，会**自底向上查找是否加载过，再由顶向下进行加载**
+
+![image-20240918221215762](https://s2.loli.net/2024/09/18/I5H6ywZFJcoqTub.png)
+
+## 源码分析
+
+首先`loadClass`提供了类加载的入口，提供双亲委派机制，内部会调用`findClass`
+
+```java
+// ClassLoader.java
+
+protected Class<?> loadClass(String name, boolean resolve)
+    throws ClassNotFoundException
+{
+    synchronized (getClassLoadingLock(name)) {
+        // First, check if the class has already been loaded
+        Class<?> c = findLoadedClass(name);
+        if (c == null) {
+            long t0 = System.nanoTime();
+            try {
+                if (parent != null) {
+                    c = parent.loadClass(name, false);
+                } else {
+                    c = findBootstrapClassOrNull(name);
+                }
+            } catch (ClassNotFoundException e) {
+                // ClassNotFoundException thrown if class not found
+                // from the non-null parent class loader
+            }
+
+            if (c == null) {
+                // If still not found, then invoke findClass in order
+                // to find the class.
+                long t1 = System.nanoTime();
+                c = findClass(name);
+
+                // this is the defining class loader; record the stats
+                PerfCounter.getParentDelegationTime().addTime(t1 - t0);
+                PerfCounter.getFindClassTime().addElapsedTimeFrom(t1);
+                PerfCounter.getFindClasses().increment();
+            }
+        }
+        if (resolve) {
+            resolveClass(c);
+        }
+        return c;
+    }
+}
+```
+
+`findClass`由类加载器的子类实现，获取二进制数据调用`defineClass`，比如`URLClassLoader`会根据文件路径去获取类文件中的二进制数据
+
+```java
+protected Class<?> findClass(final String name)
+    throws ClassNotFoundException
+{
+    final Class<?> result;
+    try {
+        result = AccessController.doPrivileged(
+            new PrivilegedExceptionAction<>() {
+                public Class<?> run() throws ClassNotFoundException {
+                    String path = name.replace('.', '/').concat(".class");
+                    Resource res = ucp.getResource(path, false);
+                    if (res != null) {
+                        try {
+                            return defineClass(name, res);
+                        } catch (IOException e) {
+                            throw new ClassNotFoundException(name, e);
+                        } catch (ClassFormatError e2) {
+                            if (res.getDataError() != null) {
+                                e2.addSuppressed(res.getDataError());
+                            }
+                            throw e2;
+                        }
+                    } else {
+                        return null;
+                    }
+                }
+            }, acc);
+    } catch (java.security.PrivilegedActionException pae) {
+        throw (ClassNotFoundException) pae.getException();
+    }
+    if (result == null) {
+        throw new ClassNotFoundException(name);
+    }
+    return result;
+}
+```
+
+最终会调用虚拟机底层的方法`defineClass`将字节码信息加载到虚拟机内存中
+
+```java
+protected final Class<?> defineClass(String name, byte[] b, int off, int len,
+                                     ProtectionDomain protectionDomain)
+    throws ClassFormatError
+{
+    protectionDomain = preDefineClass(name, protectionDomain);
+    String source = defineClassSourceLocation(protectionDomain);
+    Class<?> c = defineClass1(this, name, b, off, len, protectionDomain, source);
+    postDefineClass(c, protectionDomain);
+    return c;
+}
+
+static native Class<?> defineClass1(ClassLoader loader, String name, byte[] b, int off, int len,
+                                    ProtectionDomain pd, String source);
+```
+
+
+
+## 打破双亲委派机制的三种方式
+
+1. 自定义类加载器
+
+   > 情形：一个Tomcat程序可以运行多个Web应用，如果两个应用出现了相同限定名的类，Tomcat要保证这两个类都能加载并且它们应该是不同的类。如果不打破双亲委派机制，则另一个Web应用中的相同限定名的类就无法被加载了
+   >
+   > Tomcat使用了自定义类加载器来实现应用之间类的隔离，每一个应用都有自己的类加载器。  
+   >
+   > **自定义类加载器并重写`loadClass`方法，就可以将双亲委派机制去除**
+
+   
+
+2. 线程上下文类加载器
+
+   >![image-20240918224920851](https://s2.loli.net/2024/09/18/JgH6kl3AbCraD7N.png)
+   >
+   >![image-20240918230125834](https://s2.loli.net/2024/09/18/sAuvMFNXURjCPwl.png)
+   >
+   >**Q: `DriverManager`怎么知道jar包中要加载的驱动在哪儿？**
+   >
+   >SPI，Service Provider Interface，是JDK内置的一种服务提供发现机制
+   >
+   >工作原理：在`ClassPath`路径下的`META-INF/services`文件夹中，以接口的全限定名来命名文件名，对应的文件里面写该接口的实现。
+   >
+   >也就是说在mysql驱动的jar包中将驱动的类如`com.mysql.cj.jdbc.Driver`写在`java.sql.Driver`文件中，然后`java.sql.Driver`文件放在`META-INF/services`文件夹中即可让SPI机制发现驱动并且加载。
+   >
+   >
+   >
+   >**Q: SPI如何拿到应用程序类加载器呢？DriverManager是在启动类加载器中被加载**
+   >
+   >SPI在load的时候获取到了**上下文类加载器（应用程序类加载器）**进行委托加载
+   >
+   >```java
+   >public static <S> ServiceLoader<S> load(Class<S> service) {
+   >    ClassLoader cl = Thread.currentThread().getContextClassLoader();
+   >    return new ServiceLoader<>(Reflection.getCallerClass(), service, cl);
+   >}
+   >```
+
+   
+
+3. Osgi框架的类加载器
+
+   > 历史上，OSGI模块化框架，它存在同级之间的类加载器的委托加载，OSGI还是用类加载器实现了**热部署**的功能。
+   >
+   > ![image-20240918231238725](https://s2.loli.net/2024/09/18/AlobMzIUQhNY4P9.png)
+
+**Q: 两个自定义类加载器加载相同限定名的类，不会冲突吗？**
+
+**不会冲突**，在同一个Java虚拟机中，只有**相同类加载器+相同的类限定名**才会被认为是同一个类。
+
+
+
+## JDK 9 之后类加载器的变化
+
+1. 启动类加载器使用`Java`编写，位于`jdk.internal.loader.ClassLoaders`类中。
+
+   `Java`中的`BootClassLoader`继承自`BuiltinClassLoader`实现从模块中找到要加载的字节码资源文件。
+
+   **启动类加载器依然无法通过`java`代码获取到，返回的仍然是`null`，保持了统一**
+
+   ![image-20240919092939403](https://s2.loli.net/2024/09/19/dX1YIem9W7GCt2O.png)
+
+2. 拓展类加载器被替换成了平台类加载器（`Platform Class Loader`)
+
+   平台类加载器遵循模块化方式加载字节码文件，所以继承关系从`URLClassLoader`变成了`BuiltinClassLoader`，后者实现了从模块中加载字节码文件。
+
+   平台类加载器的存在更多的是为了与老版本设计兼容，自身没有特殊的逻辑。
+
+   ![image-20240919093255026](https://s2.loli.net/2024/09/19/zNHDuRwlVFUIg8J.png)
+
+3. 
