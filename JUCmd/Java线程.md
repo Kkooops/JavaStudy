@@ -428,4 +428,7 @@ public class Test1 {
 + TIMED_WAITING
 
   线程正在等待另一个线程执行操作，但有时间限制
+  
++ TERMINATED
 
+  线程终止
