@@ -508,7 +508,7 @@ public final class Singleton {
   new Thread(() -> {
       System.out.println(x);
       // x=20 对 t2 可见，同时 y=10 也对 t2可见
-  }).sta
+  }).start();
   ```
 
   
